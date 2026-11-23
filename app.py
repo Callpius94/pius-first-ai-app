@@ -3,12 +3,13 @@ import time
 from google import genai
 from pypdf import PdfReader
 from docx import Document
+from pptx import Presentation
 
-# 1. Load your secret key safely without unpacking
+# 1. Load your secret key safely
 with open(".env") as f:
     for line in f:
         if line.startswith("GEMINI_API_KEY="):
-            os.environ["GEMINI_API_KEY"] = line.strip().partition("=").pop(2)
+            os.environ["GEMINI_API_KEY"] = line.strip().split("=", 1).pop()
 
 client = genai.Client()
 
@@ -41,8 +42,8 @@ def translate_section(text, target_language, label):
             if response.text:
                 return response.text
         except Exception as e:
-            print(f" [{model_name} error: {e}]")
-            time.sleep(3)
+            print(f" [{model_name} rate-limited/busy, waiting 15s before trying next...]")
+            time.sleep(15)
             
     return f"[Error: Could not translate {label}.]"
 
@@ -84,14 +85,27 @@ def get_sections_from_file(filename):
                 chunk, chunk_num = [], chunk_num + 1
         if chunk:
             sections.append((f"Section {chunk_num}", "\n\n".join(chunk)))
+
+    elif lower_name.endswith(".pptx"):
+        prs = Presentation(filename)
+        print(f"\nLoaded PowerPoint '{filename}' ({len(prs.slides)} slides total).")
+        for idx, slide in enumerate(prs.slides, start=1):
+            slide_texts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    text = shape.text_frame.text.strip()
+                    if text:
+                        slide_texts.append(text)
+            sections.append((f"Slide {idx}", "\n".join(slide_texts)))
+
     else:
-        print("Unsupported file format! Please use a .pdf or .docx file.")
+        print("Unsupported file format! Please use a .pdf, .docx, or .pptx file.")
         exit()
 
     return sections
 
 # 2. Ask user for file and target language
-input_filename = input("Enter filename (e.g., sample.pdf or notes.docx): ").strip()
+input_filename = input("Enter filename (e.g., sample.pdf, notes.docx, slides.pptx): ").strip()
 target_lang = input("Enter the language to translate into (e.g., Swahili, French): ").strip()
 
 sections = get_sections_from_file(input_filename)
@@ -101,7 +115,7 @@ output_docx = f"translated_{target_lang.lower()}.docx"
 out_doc = Document()
 out_doc.add_heading(f"Corrected & Translated Document ({target_lang})", level=1)
 
-for label, text in sections:
+for idx, (label, text) in enumerate(sections):
     print(f"Processing {label}...")
     if not text.strip():
         print(f" {label} has no readable text, skipping.")
@@ -112,5 +126,9 @@ for label, text in sections:
         out_doc.add_paragraph(line)
     out_doc.add_page_break()
     out_doc.save(output_docx)
+
+    if idx < len(sections) - 1:
+        print(" Pausing 15s to stay within Free Tier per-minute limits...")
+        time.sleep(15)
 
 print(f"\nDone! Saved your Word document to: {output_docx}")
