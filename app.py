@@ -1,69 +1,116 @@
 import os
+import time
 from google import genai
 from pypdf import PdfReader
+from docx import Document
 
-# 1. Load your secret key from the .env file
+# 1. Load your secret key safely without unpacking
 with open(".env") as f:
     for line in f:
         if line.startswith("GEMINI_API_KEY="):
-            os.environ["GEMINI_API_KEY"] = line.strip().split("=", 1)[1]
+            os.environ["GEMINI_API_KEY"] = line.strip().partition("=").pop(2)
 
 client = genai.Client()
 
-def extract_text_from_pdf(pdf_path):
-    reader = PdfReader(pdf_path)
-    print(f"Found {len(reader.pages)} page(s) in PDF.")
-    full_text = []
-    for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            full_text.append(text)
-    return "\n".join(full_text)
+def clean_text(text):
+    return text.encode("utf-8", "ignore").decode("utf-8").strip()
 
-# 2. Ask the user for the PDF file name and target language
-pdf_filename = input("Enter the PDF filename (e.g., sample.pdf): ").strip()
-target_lang = input("Enter the language to translate into (e.g., Swahili, French): ").strip()
-
-print("\nReading PDF...")
-extracted_text = extract_text_from_pdf(pdf_filename)
-
-# Check if the PDF actually had readable text
-if not extracted_text.strip():
-    print("Error: No readable text was found! Your PDF might be a scanned image.")
-    exit()
-
-print(f"Extracted {len(extracted_text)} characters. Sending to Gemini...\n")
-
-prompt = f"""
-You are a helpful language assistant.
-1. Correct any English grammar, spelling, or punctuation mistakes in the document text below.
-2. Translate the corrected text into {target_lang}.
-
-Format the output with two clear headings:
---- CORRECTED ENGLISH ---
-and
---- {target_lang.upper()} TRANSLATION ---
-
-Document text:
-{extracted_text}
-"""
-
-# 3. Stream the response with automatic fallback if a model is busy
-models_to_try = ["gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3-flash-preview"]
-output_filename = f"translated_{target_lang.lower()}.txt"
-
-for model_name in models_to_try:
-    try:
-        print(f"Trying {model_name}...\n")
-        with open(output_filename, "w", encoding="utf-8") as out_file:
-            for chunk in client.models.generate_content_stream(
+def translate_section(text, target_language, label):
+    cleaned = clean_text(text)
+    prompt = f"""
+    You are a helpful language assistant.
+    1. Correct any English grammar, spelling, or punctuation mistakes in {label} below.
+    2. Translate the corrected text into {target_language}.
+    
+    Format the output clearly with two headings:
+    --- {label.upper()}: CORRECTED ENGLISH ---
+    and
+    --- {label.upper()}: {target_language.upper()} TRANSLATION ---
+    
+    Text:
+    {cleaned}
+    """
+    models_to_try = ["gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-3.8-flash"]
+    
+    for model_name in models_to_try:
+        try:
+            response = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
-            ):
-                if chunk.text:
-                    print(chunk.text, end="", flush=True)
-                    out_file.write(chunk.text)
-        print(f"\n\nDone! Saved your corrected and translated document to: {output_filename}")
-        break
-    except Exception as e:
-        print(f"\n{model_name} is currently busy ({e}). Switching to next model...\n")
+            )
+            if response.text:
+                return response.text
+        except Exception as e:
+            print(f" [{model_name} error: {e}]")
+            time.sleep(3)
+            
+    return f"[Error: Could not translate {label}.]"
+
+def get_sections_from_file(filename):
+    lower_name = filename.lower()
+    sections = []
+
+    if lower_name.endswith(".pdf"):
+        reader = PdfReader(filename)
+        total_pages = len(reader.pages)
+        print(f"\nLoaded PDF '{filename}' ({total_pages} pages total).")
+        page_range = input(
+            f"Enter page range (e.g., 1-3, 3, or press Enter for all {total_pages}): "
+        ).strip()
+
+        if not page_range:
+            start_page, end_page = 1, total_pages
+        elif "-" in page_range:
+            parts = page_range.split("-")
+            start_page = max(1, int(parts.pop(0).strip()))
+            end_page = min(total_pages, int(parts.pop().strip()))
+        else:
+            start_page = end_page = min(total_pages, max(1, int(page_range)))
+
+        for page_num in range(start_page, end_page + 1):
+            text = reader.pages[page_num - 1].extract_text() or ""
+            sections.append((f"Page {page_num}", text))
+
+    elif lower_name.endswith(".docx"):
+        doc = Document(filename)
+        paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        print(f"\nLoaded Word document '{filename}' ({len(paragraphs)} paragraphs).")
+        
+        chunk, chunk_num = [], 1
+        for para in paragraphs:
+            chunk.append(para)
+            if len("\n".join(chunk)) >= 3000:
+                sections.append((f"Section {chunk_num}", "\n\n".join(chunk)))
+                chunk, chunk_num = [], chunk_num + 1
+        if chunk:
+            sections.append((f"Section {chunk_num}", "\n\n".join(chunk)))
+    else:
+        print("Unsupported file format! Please use a .pdf or .docx file.")
+        exit()
+
+    return sections
+
+# 2. Ask user for file and target language
+input_filename = input("Enter filename (e.g., sample.pdf or notes.docx): ").strip()
+target_lang = input("Enter the language to translate into (e.g., Swahili, French): ").strip()
+
+sections = get_sections_from_file(input_filename)
+output_docx = f"translated_{target_lang.lower()}.docx"
+
+# 3. Translate and save directly into a new Word (.docx) document
+out_doc = Document()
+out_doc.add_heading(f"Corrected & Translated Document ({target_lang})", level=1)
+
+for label, text in sections:
+    print(f"Processing {label}...")
+    if not text.strip():
+        print(f" {label} has no readable text, skipping.")
+        continue
+
+    result = translate_section(text, target_lang, label)
+    for line in result.split("\n"):
+        out_doc.add_paragraph(line)
+    out_doc.add_page_break()
+    out_doc.save(output_docx)
+
+print(f"\nDone! Saved your Word document to: {output_docx}")
